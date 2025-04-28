@@ -1,0 +1,684 @@
+# mcp_browser_api/main.py
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException, StaleElementReferenceException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
+
+# Set up logging
+os.makedirs("logs", exist_ok=True)
+log_filename = f"logs/mcp_browser_api_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("mcp_browser_api")
+
+app = FastAPI(title="MCP Browser API", description="Multi-Context Processing API using Chrome browser")
+
+# Request and response models
+class SearchRequest(BaseModel):
+    query: str
+    max_results: int = 10
+    source_types: Optional[List[str]] = ["article", "blog"]
+    search_engine: str = "google"  # Options: google, bing, brave
+
+class SearchResult(BaseModel):
+    title: str
+    url: str
+    snippet: str
+    content: str = ""
+    source_type: str
+    metadata: Dict[str, Any]
+
+class SearchResponse(BaseModel):
+    results: List[SearchResult]
+
+class FetchRequest(BaseModel):
+    url: str
+
+class FetchResponse(BaseModel):
+    content: str
+
+# Browser manager
+class BrowserManager:
+    def __init__(self):
+        self.driver = None
+        self.setup_browser()
+    
+    def setup_browser(self):
+        logger.info("Setting up Chrome browser")
+        try:
+            options = Options()
+            #options.add_argument("--headless")  # Comment this out if you want to see the browser in action
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--proxy-server='direct://'")
+            options.add_argument("--proxy-bypass-list=*")
+            options.add_argument("--start-maximized")
+            options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36")
+            
+            self.driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=options
+            )
+            self.driver.set_page_load_timeout(30)
+            logger.info("Chrome browser setup complete")
+        except WebDriverException as e:
+            logger.error(f"Failed to setup Chrome: {str(e)}")
+            raise
+    
+    def close(self):
+        if self.driver:
+            logger.info("Closing Chrome browser")
+            self.driver.quit()
+    
+    def restart_browser_if_needed(self):
+        """Restart the browser if it seems to be in a bad state"""
+        try:
+            # Try a simple operation to see if browser is responsive
+            self.driver.current_url
+            return False  # Browser is fine
+        except Exception as e:
+            logger.warning(f"Browser appears to be in a bad state. Restarting. Error: {str(e)}")
+            try:
+                self.driver.quit()
+            except:
+                pass  # Ignore errors during quit
+            self.setup_browser()
+            return True  # Browser was restarted
+    
+    def google_search(self, query: str, max_results: int) -> List[SearchResult]:
+        try:
+            self.restart_browser_if_needed()
+            logger.info(f"Performing Google search for: {query}")
+            
+            # Encode the query for URL
+            encoded_query = query.replace(' ', '+')
+            
+            # Navigate to Google
+            self.driver.get("https://www.google.com")
+            time.sleep(2)  # Wait for page to fully load
+            
+            # Find and interact with the search box
+            try:
+                search_box = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.NAME, "q"))
+                )
+                search_box.clear()
+                search_box.send_keys(query)
+                search_box.submit()
+            except Exception as e:
+                logger.warning(f"Could not interact with search box: {str(e)}")
+                # Direct URL approach as fallback
+                self.driver.get(f"https://www.google.com/search?q={encoded_query}")
+            
+            # Wait for search results to load
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.g, div[data-hveid]"))
+                )
+                # Additional wait for dynamic content
+                time.sleep(3)
+            except TimeoutException:
+                logger.warning("Timeout waiting for Google search results. Will try to process anyway.")
+            
+            results = []
+            
+            # Try multiple potential selectors for Google results
+            selectors = [
+                "div.g", 
+                "div[data-hveid]", 
+                "div.tF2Cxc",
+                "div.yuRUbf",
+                "div.rc"
+            ]
+            
+            search_result_elements = []
+            for selector in selectors:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    logger.info(f"Found {len(elements)} elements with selector: {selector}")
+                    search_result_elements = elements[:max_results]
+                    break
+            
+            if not search_result_elements:
+                logger.warning("Could not find search results with any known selector")
+                # Take a screenshot for debugging
+                try:
+                    screenshot_path = f"logs/google_search_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                    self.driver.save_screenshot(screenshot_path)
+                    logger.info(f"Saved debug screenshot to {screenshot_path}")
+                except:
+                    logger.warning("Failed to save debug screenshot")
+                
+                # Try a very generic approach
+                search_result_elements = self.driver.find_elements(By.TAG_NAME, "a")[:20]  # Just get some links
+            
+            for i, element in enumerate(search_result_elements):
+                try:
+                    # Different extraction strategies based on the structure
+                    title = ""
+                    url = ""
+                    snippet = ""
+                    
+                    # Try to find title
+                    try:
+                        # Multiple possible selectors for title
+                        title_selectors = ["h3", ".LC20lb", ".DKV0Md"]
+                        for selector in title_selectors:
+                            try:
+                                title_element = element.find_element(By.CSS_SELECTOR, selector)
+                                title = title_element.text
+                                if title:
+                                    break
+                            except:
+                                continue
+                        
+                        # If still no title, try to get directly from the element
+                        if not title:
+                            title = element.text.split("\n")[0]
+                    except:
+                        # If everything fails, use a generic title
+                        title = f"Search Result {i+1}"
+                    
+                    # Try to find URL
+                    try:
+                        # Try to get href from this element if it's an anchor
+                        url = element.get_attribute("href")
+                        
+                        # If not, try to find an anchor child
+                        if not url:
+                            link_element = element.find_element(By.TAG_NAME, "a")
+                            url = link_element.get_attribute("href")
+                    except:
+                        # If we can't find a URL, this result isn't useful
+                        continue
+                    
+                    # Skip non-http URLs and Google internal links
+                    if not url or not (url.startswith("http") and "google.com/search" not in url):
+                        continue
+                    
+                    # Try to find snippet
+                    try:
+                        snippet_selectors = [".VwiC3b", ".st", ".aCOpRe", "div[data-content-feature='1']"]
+                        for selector in snippet_selectors:
+                            try:
+                                # First look inside this element
+                                snippet_element = element.find_element(By.CSS_SELECTOR, selector)
+                                snippet = snippet_element.text
+                                if snippet:
+                                    break
+                            except:
+                                continue
+                                
+                        # If still no snippet, look in nearby elements
+                        if not snippet and element.text:
+                            text_parts = element.text.split("\n")
+                            if len(text_parts) > 1:
+                                # Use everything after the first line as a snippet
+                                snippet = "\n".join(text_parts[1:])
+                    except:
+                        # If we can't find a snippet, use a generic one
+                        snippet = "No description available"
+                    
+                    # Skip results with no meaningful data
+                    if not title or title == "No title" or not url:
+                        continue
+                        
+                    # Add this result
+                    results.append(SearchResult(
+                        title=title,
+                        url=url,
+                        snippet=snippet,
+                        source_type="article",  # Default, can be refined with content analysis
+                        metadata={"search_engine": "google"}
+                    ))
+                    
+                    # Break if we have enough results
+                    if len(results) >= max_results:
+                        break
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to parse search result {i}: {str(e)}")
+            
+            logger.info(f"Found {len(results)} results from Google")
+            return results
+        except Exception as e:
+            logger.error(f"Google search error: {str(e)}")
+            # Take a screenshot for debugging
+            try:
+                screenshot_path = f"logs/google_search_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                self.driver.save_screenshot(screenshot_path)
+                logger.info(f"Saved error screenshot to {screenshot_path}")
+            except:
+                pass
+                
+            # Return empty results rather than failing
+            return []
+    
+    def bing_search(self, query: str, max_results: int) -> List[SearchResult]:
+        try:
+            self.restart_browser_if_needed()
+            logger.info(f"Performing Bing search for: {query}")
+            
+            # Navigate directly to search results
+            encoded_query = query.replace(' ', '+')
+            self.driver.get(f"https://www.bing.com/search?q={encoded_query}")
+            
+            # Wait for search results to load
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "li.b_algo, .b_results .b_algo"))
+                )
+                # Additional wait for dynamic content
+                time.sleep(2)
+            except TimeoutException:
+                logger.warning("Timeout waiting for Bing search results. Will try to process anyway.")
+            
+            results = []
+            
+            # Try multiple selectors for Bing results
+            selectors = ["li.b_algo", ".b_results .b_algo", ".b_results > li"]
+            
+            search_result_elements = []
+            for selector in selectors:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    logger.info(f"Found {len(elements)} elements with selector: {selector}")
+                    search_result_elements = elements[:max_results]
+                    break
+            
+            if not search_result_elements:
+                logger.warning("Could not find search results with any known Bing selector")
+                # Try a very generic approach
+                search_result_elements = self.driver.find_elements(By.TAG_NAME, "li")[:20]
+            
+            for i, element in enumerate(search_result_elements):
+                try:
+                    # Extract data using multiple potential selectors
+                    title = ""
+                    url = ""
+                    snippet = ""
+                    
+                    # Try to find title
+                    try:
+                        title_selectors = ["h2", ".b_title", "a"]
+                        for selector in title_selectors:
+                            try:
+                                title_element = element.find_element(By.CSS_SELECTOR, selector)
+                                title = title_element.text
+                                if title:
+                                    break
+                            except:
+                                continue
+                    except:
+                        title = f"Bing Result {i+1}"
+                    
+                    # Try to find URL
+                    try:
+                        # Check for cite element first (Bing often has URLs in cite elements)
+                        cite_selectors = ["cite", ".b_attribution", ".b_citation"]
+                        for selector in cite_selectors:
+                            try:
+                                cite_element = element.find_element(By.CSS_SELECTOR, selector)
+                                potential_url = cite_element.text
+                                if potential_url and (potential_url.startswith("http") or potential_url.startswith("www.")):
+                                    url = potential_url
+                                    if not url.startswith("http"):
+                                        url = "https://" + url
+                                    break
+                            except:
+                                continue
+                                
+                        # If no URL from cite, try anchor
+                        if not url:
+                            link_element = element.find_element(By.TAG_NAME, "a")
+                            url = link_element.get_attribute("href")
+                    except:
+                        # If we can't find a URL, this result isn't useful
+                        continue
+                    
+                    # Skip non-http URLs
+                    if not url or not url.startswith("http"):
+                        continue
+                    
+                    # Try to find snippet
+                    try:
+                        snippet_selectors = [".b_caption", "p", ".b_snippet"]
+                        for selector in snippet_selectors:
+                            try:
+                                snippet_element = element.find_element(By.CSS_SELECTOR, selector)
+                                snippet = snippet_element.text
+                                if snippet:
+                                    break
+                            except:
+                                continue
+                                
+                        # If still no snippet, use element text
+                        if not snippet and element.text:
+                            text_parts = element.text.split("\n")
+                            if len(text_parts) > 1:
+                                # Use parts after title as snippet
+                                for part in text_parts:
+                                    if part != title:
+                                        snippet += part + " "
+                    except:
+                        snippet = "No description available"
+                    
+                    if not title or not url:
+                        continue
+                    
+                    results.append(SearchResult(
+                        title=title,
+                        url=url,
+                        snippet=snippet,
+                        source_type="article",
+                        metadata={"search_engine": "bing"}
+                    ))
+                    
+                    if len(results) >= max_results:
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to parse Bing search result {i}: {str(e)}")
+            
+            logger.info(f"Found {len(results)} results from Bing")
+            return results
+        except Exception as e:
+            logger.error(f"Bing search error: {str(e)}")
+            # Return empty results rather than failing
+            return []
+    
+    def brave_search(self, query: str, max_results: int) -> List[SearchResult]:
+        try:
+            self.restart_browser_if_needed()
+            logger.info(f"Performing Brave search for: {query}")
+            
+            # Navigate directly to search results
+            encoded_query = query.replace(' ', '+')
+            self.driver.get(f"https://search.brave.com/search?q={encoded_query}")
+            
+            # Wait for search results to load
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".snippet, .fdb, .result"))
+                )
+                # Additional wait for dynamic content
+                time.sleep(2)
+            except TimeoutException:
+                logger.warning("Timeout waiting for Brave search results. Will try to process anyway.")
+            
+            results = []
+            
+            # Try multiple selectors for Brave results
+            selectors = [".snippet", ".fdb", ".result", "article"]
+            
+            search_result_elements = []
+            for selector in selectors:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    logger.info(f"Found {len(elements)} elements with selector: {selector}")
+                    search_result_elements = elements[:max_results]
+                    break
+            
+            if not search_result_elements:
+                logger.warning("Could not find search results with any known Brave selector")
+                # Try a generic approach - look for anything that might be a result
+                search_result_elements = self.driver.find_elements(By.TAG_NAME, "article")
+                if not search_result_elements:
+                    search_result_elements = self.driver.find_elements(By.TAG_NAME, "div")[:30]
+            
+            for i, element in enumerate(search_result_elements):
+                try:
+                    # Different extraction strategies for Brave search
+                    title = ""
+                    url = ""
+                    snippet = ""
+                    
+                    # Try to find title
+                    try:
+                        title_selectors = ["h3", ".title", ".snippet-title", "a.result-header"]
+                        for selector in title_selectors:
+                            try:
+                                title_element = element.find_element(By.CSS_SELECTOR, selector)
+                                title = title_element.text
+                                if title:
+                                    break
+                            except:
+                                continue
+                                
+                        if not title and element.text:
+                            # Use first line of text as title
+                            title = element.text.split("\n")[0]
+                    except:
+                        title = f"Brave Result {i+1}"
+                    
+                    # Try to find URL
+                    try:
+                        url_selectors = ["a.result-header", "a.h4", "a"]
+                        for selector in url_selectors:
+                            try:
+                                link_element = element.find_element(By.CSS_SELECTOR, selector)
+                                url = link_element.get_attribute("href")
+                                if url and url.startswith("http"):
+                                    break
+                            except:
+                                continue
+                                
+                        # Also look for display URL elements
+                        if not url or "brave.com" in url:
+                            cite_selectors = [".url", ".source-url", ".display-url"]
+                            for selector in cite_selectors:
+                                try:
+                                    cite_element = element.find_element(By.CSS_SELECTOR, selector)
+                                    potential_url = cite_element.text
+                                    if potential_url and (potential_url.startswith("http") or potential_url.startswith("www.")):
+                                        url = potential_url
+                                        if not url.startswith("http"):
+                                            url = "https://" + url
+                                        break
+                                except:
+                                    continue
+                    except:
+                        # If we can't find a URL, this result isn't useful
+                        continue
+                    
+                    # Skip unusable URLs
+                    if not url or not url.startswith("http") or "brave.com/search" in url:
+                        continue
+                    
+                    # Try to find snippet
+                    try:
+                        snippet_selectors = [".snippet-description", ".description", "p"]
+                        for selector in snippet_selectors:
+                            try:
+                                snippet_element = element.find_element(By.CSS_SELECTOR, selector)
+                                snippet = snippet_element.text
+                                if snippet:
+                                    break
+                            except:
+                                continue
+                                
+                        # If still no snippet, use element text
+                        if not snippet and element.text:
+                            lines = element.text.split("\n")
+                            if len(lines) > 1:
+                                # Skip title and use rest as snippet
+                                snippet = "\n".join([line for line in lines if line != title])
+                    except:
+                        snippet = "No description available"
+                    
+                    # Skip results with incomplete data
+                    if not title or not url:
+                        continue
+                    
+                    results.append(SearchResult(
+                        title=title,
+                        url=url,
+                        snippet=snippet,
+                        source_type="article",
+                        metadata={"search_engine": "brave"}
+                    ))
+                    
+                    if len(results) >= max_results:
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to parse Brave search result {i}: {str(e)}")
+            
+            logger.info(f"Found {len(results)} results from Brave")
+            return results
+        except Exception as e:
+            logger.error(f"Brave search error: {str(e)}")
+            # Return empty results rather than failing
+            return []
+    
+    def fetch_content(self, url: str) -> str:
+        try:
+            self.restart_browser_if_needed()
+            logger.info(f"Fetching content from URL: {url}")
+            
+            self.driver.get(url)
+            
+            # Wait for content to load
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                # Additional wait for dynamic content
+                time.sleep(3)
+            except TimeoutException:
+                logger.warning(f"Timeout while waiting for page to load: {url}")
+            
+            # Try different strategies to get the main content
+            content = ""
+            
+            # Strategy 1: Look for common content containers
+            content_selectors = [
+                "article", "#content", ".content", ".article", 
+                "main", "#main", ".main", ".post", 
+                ".entry-content", ".post-content", "#article-content",
+                ".story-body", ".story-content", ".story"
+            ]
+            
+            for selector in content_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        # Get text from all matching elements
+                        for element in elements:
+                            element_text = element.text
+                            if len(element_text) > len(content):
+                                content = element_text
+                        
+                        if content:
+                            logger.info(f"Found content using selector: {selector}")
+                            break
+                except Exception as e:
+                    logger.debug(f"Error using selector {selector}: {str(e)}")
+            
+            # Strategy 2: If no content found, use the whole body
+            if not content:
+                try:
+                    body = self.driver.find_element(By.TAG_NAME, "body")
+                    content = body.text
+                    logger.info("Using full body text as content")
+                except Exception as e:
+                    logger.error(f"Failed to get body content: {str(e)}")
+                    content = "Failed to extract content from the page."
+            
+            # Cleanup content
+            if content:
+                # Remove multiple consecutive line breaks
+                import re
+                content = re.sub(r'\n{3,}', '\n\n', content)
+            
+            logger.info(f"Successfully fetched {len(content)} characters of content")
+            return content
+        except TimeoutException:
+            logger.warning(f"Timeout while fetching content from {url}")
+            return "Content fetch timed out"
+        except Exception as e:
+            logger.error(f"Error fetching content: {str(e)}")
+            return f"Error fetching content: {str(e)}"
+
+# Initialize the browser manager
+browser_manager = None
+
+@app.on_event("startup")
+async def startup_event():
+    global browser_manager
+    browser_manager = BrowserManager()
+    logger.info("MCP Browser API started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global browser_manager
+    if browser_manager:
+        browser_manager.close()
+    logger.info("MCP Browser API shut down")
+
+@app.post("/search", response_model=SearchResponse)
+async def search(request: SearchRequest):
+    try:
+        logger.info(f"Search request received: {request.dict()}")
+        
+        # Select the appropriate search engine
+        if request.search_engine.lower() == "google":
+            results = browser_manager.google_search(request.query, request.max_results)
+        elif request.search_engine.lower() == "bing":
+            results = browser_manager.bing_search(request.query, request.max_results)
+        elif request.search_engine.lower() == "brave":
+            results = browser_manager.brave_search(request.query, request.max_results)
+        else:
+            logger.warning(f"Unsupported search engine: {request.search_engine}")
+            raise HTTPException(status_code=400, detail=f"Unsupported search engine: {request.search_engine}")
+        
+        # Filter results by source_type if specified
+        if request.source_types:
+            # In a real implementation, this would involve content analysis to determine the source type
+            # Here we're just passing through as we're assuming all results are "article" type
+            pass
+        
+        return SearchResponse(results=results)
+    except Exception as e:
+        logger.error(f"Error in search endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+
+@app.post("/fetch", response_model=FetchResponse)
+async def fetch(request: FetchRequest):
+    try:
+        logger.info(f"Fetch request received for URL: {request.url}")
+        content = browser_manager.fetch_content(request.url)
+        return FetchResponse(content=content)
+    except Exception as e:
+        logger.error(f"Error in fetch endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Fetch error: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint to verify if the API is working"""
+    return {"status": "healthy", "time": datetime.now().isoformat()}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
