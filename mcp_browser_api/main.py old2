@@ -1,0 +1,598 @@
+# mcp_browser_api/main.py
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel, HttpUrl
+from playwright.async_api import async_playwright, Playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
+
+# Set up logging
+os.makedirs("logs", exist_ok=True)
+log_filename = f"logs/mcp_browser_api_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("mcp_browser_api")
+
+app = FastAPI(title="MCP Browser API", description="Multi-Context Processing API using Playwright browser automation")
+
+# Request and response models
+class SearchRequest(BaseModel):
+    query: str
+    max_results: int = 10
+    source_types: Optional[List[str]] = ["article", "blog"]
+    search_engine: str = "google"  # Options: google, bing, brave
+
+class SearchResult(BaseModel):
+    title: str
+    url: str
+    snippet: str
+    content: str = ""
+    source_type: str
+    metadata: Dict[str, Any]
+
+class SearchResponse(BaseModel):
+    results: List[SearchResult]
+    query: str
+    search_engine: str
+    timestamp: str
+
+class FetchRequest(BaseModel):
+    url: HttpUrl  # Using HttpUrl type for validation
+
+class FetchResponse(BaseModel):
+    url: str
+    content: str
+    title: str
+    metadata: Dict[str, Any]
+    timestamp: str
+
+# Browser manager
+class PlaywrightBrowserManager:
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self._lock = asyncio.Lock()
+        self._initialized = False
+    
+    async def initialize(self):
+        """Initialize the Playwright browser instance asynchronously"""
+        if self._initialized:
+            return
+        
+        async with self._lock:
+            if not self._initialized:
+                logger.info("Initializing Playwright browser")
+                try:
+                    self.playwright = await async_playwright().start()
+                    self.browser = await self.playwright.chromium.launch(
+                        headless=True,  # Set to False to see the browser in action
+                        args=[
+                            "--disable-dev-shm-usage",
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-gpu",
+                            "--disable-web-security",
+                            "--disable-features=IsolateOrigins,site-per-process",
+                        ]
+                    )
+                    
+                    # Create a persistent context for better performance
+                    self.context = await self.browser.new_context(
+                        viewport={"width": 1920, "height": 1080},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+                        java_script_enabled=True,
+                    )
+                    
+                    self._initialized = True
+                    logger.info("Playwright browser initialized successfully")
+                except Exception as e:
+                    logger.error(f"Failed to initialize Playwright browser: {str(e)}")
+                    raise
+    
+    async def close(self):
+        """Close all Playwright resources"""
+        if self._initialized:
+            logger.info("Closing Playwright browser")
+            try:
+                if self.context:
+                    await self.context.close()
+                if self.browser:
+                    await self.browser.close()
+                if self.playwright:
+                    await self.playwright.stop()
+                
+                self._initialized = False
+                logger.info("Playwright browser closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing Playwright browser: {str(e)}")
+    
+    async def get_page(self):
+        """Get a new page from the browser context"""
+        if not self._initialized:
+            await self.initialize()
+        
+        page = await self.context.new_page()
+        return page
+    
+    async def google_search(self, query: str, max_results: int) -> List[SearchResult]:
+        """Perform a Google search and extract results"""
+        try:
+            logger.info(f"Performing Google search for: {query}")
+            
+            # Get a new page
+            page = await self.get_page()
+            
+            try:
+                # Configure page timeouts
+                page.set_default_timeout(30000)  # 30 seconds for all operations
+                
+                # Navigate to Google and perform search
+                await page.goto("https://www.google.com/")
+                
+                # Accept cookies if the banner appears
+                try:
+                    accept_button = page.get_by_role("button", name="Accept all")
+                    if await accept_button.is_visible(timeout=3000):
+                        await accept_button.click()
+                        await page.wait_for_load_state("networkidle")
+                except Exception as e:
+                    logger.debug(f"No cookie consent needed or error: {str(e)}")
+                
+                # Fill the search box and submit
+                await page.fill('textarea[name="q"]', query)
+                await page.press('textarea[name="q"]', 'Enter')
+                
+                # Wait for search results to load
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_selector("#search")
+                
+                # Give some extra time for dynamic content
+                await asyncio.sleep(2)
+                
+                # Take a screenshot for debugging
+                debug_dir = "logs/debug_screenshots"
+                os.makedirs(debug_dir, exist_ok=True)
+                await page.screenshot(path=f"{debug_dir}/google_search_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                
+                # Extract search results
+                results = []
+                
+                # Advanced CSS selector to target organic search results
+                # This avoids ads and other non-result elements
+                result_elements = await page.query_selector_all("div#search div.g")
+                
+                if not result_elements:
+                    # Try alternative selector if the first one doesn't work
+                    result_elements = await page.query_selector_all("#rso div.g, #search div[data-sokoban-container]")
+                
+                logger.info(f"Found {len(result_elements)} raw search result elements")
+                
+                for i, element in enumerate(result_elements):
+                    if i >= max_results:
+                        break
+                        
+                    try:
+                        # Extract title
+                        title_element = await element.query_selector("h3")
+                        title = await title_element.inner_text() if title_element else "No title"
+                        
+                        # Extract URL
+                        link_element = await element.query_selector("a")
+                        url = await link_element.get_attribute("href") if link_element else None
+                        
+                        # Skip if no valid URL
+                        if not url or not url.startswith("http"):
+                            continue
+                            
+                        # Extract snippet
+                        snippet_element = await element.query_selector("div[data-content-feature='1']")
+                        if not snippet_element:
+                            # Try alternative selector for the snippet
+                            snippet_element = await element.query_selector("div.VwiC3b, div.yuRUbf + div")
+                            
+                        snippet = await snippet_element.inner_text() if snippet_element else "No description available"
+                        
+                        # Add the result to our list
+                        results.append(SearchResult(
+                            title=title,
+                            url=url,
+                            snippet=snippet,
+                            source_type="article",  # Default, can be refined
+                            metadata={
+                                "search_engine": "google",
+                                "position": i + 1,
+                                "query": query
+                            }
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Error parsing Google search result {i}: {str(e)}")
+                
+                logger.info(f"Successfully extracted {len(results)} Google search results")
+                return results
+            finally:
+                # Always close the page when done
+                await page.close()
+                
+        except Exception as e:
+            logger.error(f"Google search error: {str(e)}")
+            return []
+    
+    async def bing_search(self, query: str, max_results: int) -> List[SearchResult]:
+        """Perform a Bing search and extract results"""
+        try:
+            logger.info(f"Performing Bing search for: {query}")
+            
+            # Get a new page
+            page = await self.get_page()
+            
+            try:
+                # Configure page timeouts
+                page.set_default_timeout(30000)  # 30 seconds
+                
+                # Navigate directly to Bing search results
+                encoded_query = query.replace(' ', '+')
+                await page.goto(f"https://www.bing.com/search?q={encoded_query}")
+                
+                # Accept cookies if shown
+                try:
+                    accept_button = page.get_by_role("button", name="Accept")
+                    if await accept_button.is_visible(timeout=3000):
+                        await accept_button.click()
+                except Exception:
+                    pass
+                
+                # Wait for results to load
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_selector("#b_results")
+                
+                # Give extra time for dynamic content
+                await asyncio.sleep(2)
+                
+                # Extract search results
+                results = []
+                
+                # Target organic search results
+                result_elements = await page.query_selector_all("#b_results > li.b_algo")
+                logger.info(f"Found {len(result_elements)} raw Bing search result elements")
+                
+                for i, element in enumerate(result_elements):
+                    if i >= max_results:
+                        break
+                        
+                    try:
+                        # Extract title and URL
+                        title_element = await element.query_selector("h2 a")
+                        title = await title_element.inner_text() if title_element else "No title"
+                        url = await title_element.get_attribute("href") if title_element else None
+                        
+                        # Skip if no valid URL
+                        if not url or not url.startswith("http"):
+                            continue
+                            
+                        # Extract snippet
+                        snippet_element = await element.query_selector(".b_caption p")
+                        snippet = await snippet_element.inner_text() if snippet_element else "No description available"
+                        
+                        # Add the result
+                        results.append(SearchResult(
+                            title=title,
+                            url=url,
+                            snippet=snippet,
+                            source_type="article",
+                            metadata={
+                                "search_engine": "bing",
+                                "position": i + 1,
+                                "query": query
+                            }
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Error parsing Bing search result {i}: {str(e)}")
+                
+                logger.info(f"Successfully extracted {len(results)} Bing search results")
+                return results
+            finally:
+                await page.close()
+                
+        except Exception as e:
+            logger.error(f"Bing search error: {str(e)}")
+            return []
+    
+    async def brave_search(self, query: str, max_results: int) -> List[SearchResult]:
+        """Perform a Brave search and extract results"""
+        try:
+            logger.info(f"Performing Brave search for: {query}")
+            
+            # Get a new page
+            page = await self.get_page()
+            
+            try:
+                # Configure page timeouts
+                page.set_default_timeout(30000)
+                
+                # Navigate to Brave Search with the query
+                encoded_query = query.replace(' ', '+')
+                await page.goto(f"https://search.brave.com/search?q={encoded_query}")
+                
+                # Wait for results to load
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_selector("main")
+                
+                # Give extra time for dynamic content
+                await asyncio.sleep(2)
+                
+                # Extract search results
+                results = []
+                
+                # Target organic search results
+                result_elements = await page.query_selector_all(".snippet")
+                if not result_elements:
+                    result_elements = await page.query_selector_all(".fdb")
+                
+                logger.info(f"Found {len(result_elements)} raw Brave search result elements")
+                
+                for i, element in enumerate(result_elements):
+                    if i >= max_results:
+                        break
+                        
+                    try:
+                        # Extract title and URL
+                        title_element = await element.query_selector(".snippet-title a, .title a")
+                        title = await title_element.inner_text() if title_element else "No title"
+                        url = await title_element.get_attribute("href") if title_element else None
+                        
+                        # Skip if no valid URL or Brave internal URL
+                        if not url or not url.startswith("http") or "brave.com/search" in url:
+                            continue
+                            
+                        # Extract snippet
+                        snippet_element = await element.query_selector(".snippet-description, .description")
+                        snippet = await snippet_element.inner_text() if snippet_element else "No description available"
+                        
+                        # Add the result
+                        results.append(SearchResult(
+                            title=title,
+                            url=url,
+                            snippet=snippet,
+                            source_type="article",
+                            metadata={
+                                "search_engine": "brave",
+                                "position": i + 1,
+                                "query": query
+                            }
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Error parsing Brave search result {i}: {str(e)}")
+                
+                logger.info(f"Successfully extracted {len(results)} Brave search results")
+                return results
+            finally:
+                await page.close()
+                
+        except Exception as e:
+            logger.error(f"Brave search error: {str(e)}")
+            return []
+    
+    async def fetch_content(self, url: str) -> Dict[str, Any]:
+        """Fetch and extract content from a URL"""
+        try:
+            logger.info(f"Fetching content from URL: {url}")
+            
+            # Get a new page
+            page = await self.get_page()
+            
+            try:
+                # Configure page timeouts and behavior
+                page.set_default_timeout(45000)  # 45 seconds for longer content
+                
+                # Navigate to the URL
+                response = await page.goto(url, wait_until="domcontentloaded")
+                
+                # Check if navigation was successful
+                if not response or response.status >= 400:
+                    logger.error(f"Failed to load page: HTTP {response.status if response else 'unknown'}")
+                    return {
+                        "content": f"Failed to load page. HTTP status: {response.status if response else 'unknown'}",
+                        "title": "Error loading page",
+                        "metadata": {"error": True, "status": response.status if response else None}
+                    }
+                
+                # Wait for the page to stabilize
+                await page.wait_for_load_state("networkidle")
+                
+                # Get the page title
+                title = await page.title()
+                
+                # Extract metadata
+                metadata = {
+                    "url": url,
+                    "fetch_time": datetime.now().isoformat(),
+                    "content_type": response.headers.get("content-type", "unknown"),
+                }
+                
+                # Take a screenshot for debugging
+                debug_dir = "logs/debug_screenshots"
+                os.makedirs(debug_dir, exist_ok=True)
+                await page.screenshot(path=f"{debug_dir}/fetch_content_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                
+                # Extract the main content
+                # Try different strategies to get the most relevant content
+                content = ""
+                
+                # Strategy 1: Look for content in semantic HTML elements
+                content_selectors = [
+                    "article", "main", "#content", ".content", ".article", 
+                    "#main-content", ".main-content", ".post-content", ".entry-content",
+                    "[role='main']", ".story-content"
+                ]
+                
+                for selector in content_selectors:
+                    try:
+                        elements = await page.query_selector_all(selector)
+                        for element in elements:
+                            element_text = await element.inner_text()
+                            # Take the longest content found
+                            if len(element_text) > len(content):
+                                content = element_text
+                                
+                        if content and len(content) > 200:
+                            logger.info(f"Found main content using selector: {selector}")
+                            break
+                    except Exception as e:
+                        logger.debug(f"Error with content selector {selector}: {str(e)}")
+                
+                # Strategy 2: Try to remove navigation, headers, footers, etc.
+                if not content or len(content) < 200:
+                    try:
+                        # Remove common non-content elements
+                        remove_selectors = [
+                            "header", "footer", "nav", "#header", "#footer", "#nav", 
+                            ".header", ".footer", ".nav", ".sidebar", "#sidebar",
+                            ".menu", "#menu", ".advertisement", ".ads", ".comments"
+                        ]
+                        
+                        for selector in remove_selectors:
+                            elements = await page.query_selector_all(selector)
+                            for element in elements:
+                                try:
+                                    await page.evaluate("(element) => element.remove()", element)
+                                except:
+                                    pass
+                        
+                        # Get the body content after removing clutter
+                        body = await page.query_selector("body")
+                        if body:
+                            content = await body.inner_text()
+                            logger.info("Using filtered body text as content")
+                    except Exception as e:
+                        logger.error(f"Error in content filtering: {str(e)}")
+                
+                # Strategy 3: If all else fails, use the whole body
+                if not content:
+                    try:
+                        body = await page.query_selector("body")
+                        content = await body.inner_text() if body else ""
+                        logger.info("Using full body text as content")
+                    except Exception as e:
+                        logger.error(f"Failed to get body content: {str(e)}")
+                        content = "Failed to extract content from the page."
+                
+                # Clean up the content
+                if content:
+                    import re
+                    # Remove excessive whitespace
+                    content = re.sub(r'\s+', ' ', content)
+                    # Remove consecutive line breaks
+                    content = re.sub(r'\n{3,}', '\n\n', content)
+                
+                logger.info(f"Successfully fetched {len(content)} characters of content")
+                
+                return {
+                    "content": content,
+                    "title": title,
+                    "metadata": metadata
+                }
+            finally:
+                await page.close()
+                
+        except PlaywrightTimeoutError:
+            logger.warning(f"Timeout while fetching content from {url}")
+            return {
+                "content": "Content fetch timed out",
+                "title": "Timeout Error",
+                "metadata": {"error": True, "reason": "timeout"}
+            }
+        except Exception as e:
+            logger.error(f"Error fetching content: {str(e)}")
+            return {
+                "content": f"Error fetching content: {str(e)}",
+                "title": "Error",
+                "metadata": {"error": True, "reason": str(e)}
+            }
+
+# Global browser manager
+browser_manager = None
+
+@app.on_event("startup")
+async def startup_event():
+    global browser_manager
+    browser_manager = PlaywrightBrowserManager()
+    await browser_manager.initialize()
+    logger.info("MCP Browser API started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global browser_manager
+    if browser_manager:
+        await browser_manager.close()
+    logger.info("MCP Browser API shut down")
+
+@app.post("/search", response_model=SearchResponse)
+async def search(request: SearchRequest):
+    try:
+        logger.info(f"Search request received: {request.dict()}")
+        
+        # Select the appropriate search engine
+        if request.search_engine.lower() == "google":
+            results = await browser_manager.google_search(request.query, request.max_results)
+        elif request.search_engine.lower() == "bing":
+            results = await browser_manager.bing_search(request.query, request.max_results)
+        elif request.search_engine.lower() == "brave":
+            results = await browser_manager.brave_search(request.query, request.max_results)
+        else:
+            logger.warning(f"Unsupported search engine: {request.search_engine}")
+            raise HTTPException(status_code=400, detail=f"Unsupported search engine: {request.search_engine}")
+        
+        # Filter results by source_type if needed
+        # Note: This would require content analysis for accurate filtering
+        
+        return SearchResponse(
+            results=results,
+            query=request.query,
+            search_engine=request.search_engine,
+            timestamp=datetime.now().isoformat()
+        )
+    except Exception as e:
+        logger.error(f"Error in search endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+
+@app.post("/fetch", response_model=FetchResponse)
+async def fetch(request: FetchRequest):
+    try:
+        logger.info(f"Fetch request received for URL: {request.url}")
+        content_data = await browser_manager.fetch_content(str(request.url))
+        
+        return FetchResponse(
+            url=str(request.url),
+            content=content_data["content"],
+            title=content_data["title"],
+            metadata=content_data["metadata"],
+            timestamp=datetime.now().isoformat()
+        )
+    except Exception as e:
+        logger.error(f"Error in fetch endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Fetch error: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint to verify if the API is working"""
+    return {
+        "status": "healthy", 
+        "time": datetime.now().isoformat(),
+        "browser_status": "initialized" if browser_manager and browser_manager._initialized else "not_initialized"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

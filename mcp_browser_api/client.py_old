@@ -1,0 +1,102 @@
+# mcp_browser_api/client.py
+import requests
+import json
+import logging
+from typing import List, Dict, Any, Optional
+
+class MCPBrowserClient:
+    def __init__(self, base_url: str = "http://localhost:8000"):
+        self.base_url = base_url
+        self.logger = logging.getLogger("mcp_browser_client")
+    
+    def search(self, 
+               query: str, 
+               max_results: int = 10, 
+               source_types: Optional[List[str]] = None, 
+               search_engine: str = "google") -> Dict[str, Any]:
+        """
+        Search the web using the specified search engine.
+        
+        Args:
+            query: The search query string
+            max_results: Maximum number of results to return
+            source_types: List of source types to filter by (e.g. ["article", "blog"])
+            search_engine: The search engine to use (google, bing, or brave)
+            
+        Returns:
+            Dictionary containing search results
+        """
+        if source_types is None:
+            source_types = ["article", "blog"]
+            
+        payload = {
+            "query": query,
+            "max_results": max_results,
+            "source_types": source_types,
+            "search_engine": search_engine
+        }
+        
+        self.logger.info(f"Sending search request: {query} (engine: {search_engine})")
+        response = requests.post(f"{self.base_url}/search", json=payload)
+        
+        if response.status_code == 200:
+            results = response.json()
+            self.logger.info(f"Search completed. Found {len(results.get('results', []))} results.")
+            return results
+        else:
+            self.logger.error(f"Search failed with status code {response.status_code}: {response.text}")
+            return {"error": response.text, "status_code": response.status_code}
+    
+    def fetch(self, url: str) -> Dict[str, Any]:
+        """
+        Fetch the full content from a URL.
+        
+        Args:
+            url: The URL to fetch content from
+            
+        Returns:
+            Dictionary containing the fetched content
+        """
+        payload = {"url": url}
+        
+        self.logger.info(f"Sending fetch request for URL: {url}")
+        response = requests.post(f"{self.base_url}/fetch", json=payload)
+        
+        if response.status_code == 200:
+            content = response.json()
+            content_length = len(content.get("content", ""))
+            self.logger.info(f"Fetch completed. Retrieved {content_length} characters of content.")
+            return content
+        else:
+            self.logger.error(f"Fetch failed with status code {response.status_code}: {response.text}")
+            return {"error": response.text, "status_code": response.status_code}
+
+
+if __name__ == "__main__":
+    # Example usage
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    client = MCPBrowserClient()
+    
+    # Example 1: Search with Google
+    google_results = client.search("python fastapi tutorial", max_results=5)
+    print("\nGoogle Search Results:")
+    for i, result in enumerate(google_results.get("results", [])):
+        print(f"{i+1}. {result['title']} - {result['url']}")
+    
+    # Example 2: Search with Bing
+    bing_results = client.search("machine learning basics", max_results=3, search_engine="bing")
+    print("\nBing Search Results:")
+    for i, result in enumerate(bing_results.get("results", [])):
+        print(f"{i+1}. {result['title']} - {result['url']}")
+    
+    # Example 3: Fetch content from a URL
+    if google_results.get("results"):
+        first_url = google_results["results"][0]["url"]
+        content = client.fetch(first_url)
+        print(f"\nFetched content from {first_url}:")
+        print(f"Content length: {len(content.get('content', ''))}")
+        print(content.get("content", "")[:200] + "...")  # Print first 200 chars

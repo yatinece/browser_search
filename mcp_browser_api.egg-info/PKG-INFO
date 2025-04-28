@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: mcp-browser-api
+Version: 0.1.0
+Summary: Multi-Context Processing API using Chrome browser
+Author: MCP Browser API Developer
+Author-email: yatinece@gmail.com
+Keywords: mcp,api,browser,chrome,search
+Requires-Python: >=3.8
