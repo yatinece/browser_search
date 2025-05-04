@@ -3,6 +3,7 @@ from setuptools.command.install import install as _install
 import subprocess
 import sys
 
+
 class PostInstallCommand(_install):
     """Post-installation for installation mode: installs Playwright browsers."""
     def run(self):
@@ -28,6 +29,7 @@ setup(
         "playwright-stealth",
         "pymupdf",
         "aiohttp",
+        "urllib",
     ],
     cmdclass={
         'install': PostInstallCommand,

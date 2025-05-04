@@ -6,6 +6,7 @@ import random
 from .schema import SearchRequest , SearchResult , SearchResponse, FetchRequest, FetchResponse
 import re
 from datetime import datetime
+from datetime import date
 from typing import List, Dict, Any, Optional
 from .DocumentHandler import DocumentHandler
 from playwright.async_api import (
@@ -14,6 +15,7 @@ from playwright.async_api import (
 # Make sure stealth is installed: pip install playwright-stealth
 from playwright_stealth import stealth_async
 from dotenv import load_dotenv
+import urllib
 load_dotenv()  # Automatically looks for .env in current dir
 # ========================================================================
 # Configuration Constants & Environment Variables
@@ -264,172 +266,207 @@ class PlaywrightBrowserManager:
             return page
 
 
-    async def Google_Search(self, query: str, max_results: int) -> List[SearchResult]:
-            page = None
-            # --- Selectors based on provided snippet (May need testing/adjustment) ---
-            search_input_selector = 'textarea[name="q"]'
-            # Main container usually holding organic results
-            results_container_selector = "#search"
-            # Selector for one individual search result block (derived from snippet)
-            result_item_selector = "div.N54PNb.BToiNc"
-            # Selector for the link element containing the title and URL within a result item
-            link_block_selector = "div.yuRUbf" # Contains the 'a' tag
-            link_selector = f"{link_block_selector} a" # The 'a' tag itself
-            # Selector for the title text (h3) within the link element
-            title_selector = "h3.LC20lb"
-            # Selector for the description text block within a result item
-            snippet_selector = "div.VwiC3b"
-            # Fallback result selector if the primary one fails (e.g., original 'div.g')
-            fallback_result_item_selector = "div.g" # Keep the old reliable 'g' class as a fallback
-            # --------------------------------------------------------------------------
+    async def Google_Search(self, query: str, max_results: int, time_filter: Optional[str] = None, custom_start_date: Optional[date] = None, custom_end_date: Optional[date] = None) -> List[SearchResult]:
+        page = None
+        # --- Selectors based on provided snippet (May need testing/adjustment) ---
+        search_input_selector = 'textarea[name="q"]'
+        # Main container usually holding organic results
+        results_container_selector = "#search"
+        # Selector for one individual search result block (derived from snippet)
+        result_item_selector = "div.N54PNb.BToiNc"
+        # Selector for the link element containing the title and URL within a result item
+        link_block_selector = "div.yuRUbf" # Contains the 'a' tag
+        link_selector = f"{link_block_selector} a" # The 'a' tag itself
+        # Selector for the title text (h3) within the link element
+        title_selector = "h3.LC20lb"
+        # Selector for the description text block within a result item
+        snippet_selector = "div.VwiC3b"
+        # Fallback result selector if the primary one fails (e.g., original 'div.g')
+        fallback_result_item_selector = "div.g" # Keep the old reliable 'g' class as a fallback
+        # --------------------------------------------------------------------------
 
-            logger.info(f"Performing Google search for: '{query}' (max_results: {max_results})")
+        logger.info(f"Performing Google search for: '{query}' (max_results: {max_results})")
 
+        try:
+            page = await self.get_page() # Stealth applied automatically
+
+            logger.debug("Navigating to https://www.google.com/")
+            await page.goto("https://www.google.com/", wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(0.5, 1.5)) # Short delay after nav
+
+            # --- Cookie Consent Handling ---
             try:
-                page = await self.get_page() # Stealth applied automatically
+                accept_button = page.get_by_role("button", name="Accept all")
+                if await accept_button.is_visible(timeout=COOKIE_VISIBLE_TIMEOUT):
+                    logger.info("Cookie consent banner found. Clicking 'Accept all'.")
+                    await accept_button.click()
+                    await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                    logger.debug("Cookie consent accepted.")
+                else:
+                    logger.debug("Cookie consent banner not found or not visible within timeout.")
+            except Exception as cookie_err:
+                logger.warning(f"Could not find or click cookie button (might be okay): {cookie_err}")
+                # Avoid taking screenshot here unless absolutely necessary for debugging cookies
 
-                logger.debug("Navigating to https://www.google.com/")
-                await page.goto("https://www.google.com/", wait_until="domcontentloaded")
-                await asyncio.sleep(random.uniform(0.5, 1.5)) # Short delay after nav
+            await page.mouse.move(random.randint(100, 500), random.randint(100, 500)) # Human-like interaction
+            await asyncio.sleep(random.uniform(0.2, 0.8))
 
-                # --- Cookie Consent Handling (same as before) ---
+            # --- Perform Search ---
+            try:
+                logger.debug(f"Waiting for search input ('{search_input_selector}') to be visible...")
+                await page.wait_for_selector(search_input_selector, state='visible', timeout=ELEMENT_VISIBLE_TIMEOUT)
+                logger.debug("Search input is visible. Filling query.")
+                await page.fill(search_input_selector, query)
+                await asyncio.sleep(random.uniform(0.3, 0.7))
+                logger.debug("Submitting search query.")
+                await page.press(search_input_selector, 'Enter')
+            except Exception as search_fill_err:
+                logger.error(f"Error finding or filling the search box ('{search_input_selector}'): {search_fill_err}")
+                await page.screenshot(path=self.get_screenshot_path("Google Search_fill_error"))
+                raise # Re-raise the error to stop execution here
+
+            # Wait for initial search results to load
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+            # Get the current URL after the search
+            current_url = page.url
+            logger.debug(f"Current URL after search: {current_url}")
+            
+            # Now add time filter parameter if needed
+            if time_filter:
+                logger.info(f"Applying time filter: {time_filter}")
+                filter_param = self.get_time_filter_param("google", time_filter, custom_start_date, custom_end_date)
+                
+                # Parse the current URL and add the time filter
+                parsed_url = urllib.parse.urlparse(current_url)
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                
+                # Create a new query string with the added time parameter
+                for key, value in urllib.parse.parse_qs(filter_param.lstrip('&')).items():
+                    query_params[key] = value
+                
+                new_query = urllib.parse.urlencode(query_params, doseq=True)
+                new_url = urllib.parse.urlunparse((
+                    parsed_url.scheme,
+                    parsed_url.netloc,
+                    parsed_url.path,
+                    parsed_url.params,
+                    new_query,
+                    parsed_url.fragment
+                ))
+                
+                logger.debug(f"Navigating to URL with time filter: {new_url}")
+                await page.goto(new_url, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(0.5, 1.5))  # Short delay after navigation
+
+            # --- Wait for Results & Extract ---
+            logger.debug(f"Waiting for search results container ('{results_container_selector}')")
+            await page.wait_for_selector(results_container_selector, timeout=SEARCH_RESULTS_TIMEOUT)
+            # Wait slightly longer for results to potentially render after container appears
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(random.uniform(1.5, 3.0)) # Increased sleep slightly
+
+            await page.screenshot(path=self.get_screenshot_path("Google Search_results"))
+            logger.debug("Search results page loaded. Extracting results...")
+
+            results: List[SearchResult] = []
+            logger.debug(f"Querying for result items using primary selector: '{result_item_selector}'")
+            result_elements = await page.query_selector_all(result_item_selector)
+
+            # --- Fallback Selector Logic ---
+            if not result_elements:
+                logger.warning(f"Primary result selector ('{result_item_selector}') found 0 elements. Trying fallback ('{fallback_result_item_selector}')...")
+                result_elements = await page.query_selector_all(fallback_result_item_selector)
+                if result_elements:
+                    logger.info(f"Fallback selector ('{fallback_result_item_selector}') found {len(result_elements)} elements.")
+                    # Adjust snippet selector if using fallback 'g' - requires re-inspection for 'g' elements
+                    # For now, we'll try the same snippet selector, but it might be wrong for 'g' elements.
+                    # A more robust solution would check which selector succeeded and use appropriate sub-selectors.
+                else:
+                    logger.error(f"Both primary and fallback selectors failed to find result elements. Check Google's current HTML structure.")
+                    # Optional: Log page content if results aren't found
+                    # page_content = await page.content()
+                    # logger.debug(f"Page HTML when no results found:\n{page_content[:1000]}...") # Log first 1k chars
+
+            logger.info(f"Found {len(result_elements)} potential search result elements using final selector.")
+            count = 0
+            for i, element in enumerate(result_elements):
+                if count >= max_results:
+                    logger.info(f"Reached max_results ({max_results}). Stopping extraction.")
+                    break
                 try:
-                    accept_button = page.get_by_role("button", name="Accept all")
-                    if await accept_button.is_visible(timeout=COOKIE_VISIBLE_TIMEOUT):
-                        logger.info("Cookie consent banner found. Clicking 'Accept all'.")
-                        await accept_button.click()
-                        await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-                        logger.debug("Cookie consent accepted.")
-                    else:
-                        logger.debug("Cookie consent banner not found or not visible within timeout.")
-                except Exception as cookie_err:
-                    logger.warning(f"Could not find or click cookie button (might be okay): {cookie_err}")
-                    # Avoid taking screenshot here unless absolutely necessary for debugging cookies
-                    # await page.screenshot(path=get_screenshot_path("google_cookie_error"))
+                    # Find link and title within the result element
+                    link_element = await element.query_selector(link_selector)
+                    title_element = await element.query_selector(title_selector) # Title is often inside link, but selector targets h3 directly
 
-                await page.mouse.move(random.randint(100, 500), random.randint(100, 500)) # Human-like interaction
-                await asyncio.sleep(random.uniform(0.2, 0.8))
+                    # Get URL from link element
+                    url = await link_element.get_attribute("href") if link_element else None
+                    # Get Title text
+                    title = await title_element.inner_text() if title_element else None
 
-                # --- Perform Search (same as before) ---
-                try:
-                    logger.debug(f"Waiting for search input ('{search_input_selector}') to be visible...")
-                    await page.wait_for_selector(search_input_selector, state='visible', timeout=ELEMENT_VISIBLE_TIMEOUT)
-                    logger.debug("Search input is visible. Filling query.")
-                    await page.fill(search_input_selector, query)
-                    await asyncio.sleep(random.uniform(0.3, 0.7))
-                    logger.debug("Submitting search query.")
-                    await page.press(search_input_selector, 'Enter')
-                except Exception as search_fill_err:
-                    logger.error(f"Error finding or filling the search box ('{search_input_selector}'): {search_fill_err}")
-                    await page.screenshot(path=self.get_screenshot_path("Google Search_fill_error"))
-                    raise # Re-raise the error to stop execution here
+                    # Basic validation
+                    if not title or not url or not url.startswith("http"):
+                        # Try finding title directly within the element if not in link (less common structure)
+                        if not title:
+                            h3_direct = await element.query_selector(title_selector)
+                            if h3_direct: title = await h3_direct.inner_text()
+                        if not url:
+                            a_direct = await element.query_selector("a") # Simplest 'a' tag fallback
+                            if a_direct: url = await a_direct.get_attribute("href")
 
-                # --- Wait for Results & Extract ---
-                logger.debug(f"Waiting for search results container ('{results_container_selector}')")
-                await page.wait_for_selector(results_container_selector, timeout=SEARCH_RESULTS_TIMEOUT)
-                # Wait slightly longer for results to potentially render after container appears
-                await page.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(random.uniform(1.5, 3.0)) # Increased sleep slightly
-
-                await page.screenshot(path=self.get_screenshot_path("Google Search_results"))
-                logger.debug("Search results page loaded. Extracting results...")
-
-                results: List[SearchResult] = []
-                logger.debug(f"Querying for result items using primary selector: '{result_item_selector}'")
-                result_elements = await page.query_selector_all(result_item_selector)
-
-                # --- Fallback Selector Logic ---
-                if not result_elements:
-                    logger.warning(f"Primary result selector ('{result_item_selector}') found 0 elements. Trying fallback ('{fallback_result_item_selector}')...")
-                    result_elements = await page.query_selector_all(fallback_result_item_selector)
-                    if result_elements:
-                        logger.info(f"Fallback selector ('{fallback_result_item_selector}') found {len(result_elements)} elements.")
-                        # Adjust snippet selector if using fallback 'g' - requires re-inspection for 'g' elements
-                        # For now, we'll try the same snippet selector, but it might be wrong for 'g' elements.
-                        # A more robust solution would check which selector succeeded and use appropriate sub-selectors.
-                    else:
-                        logger.error(f"Both primary and fallback selectors failed to find result elements. Check Google's current HTML structure.")
-                        # Optional: Log page content if results aren't found
-                        # page_content = await page.content()
-                        # logger.debug(f"Page HTML when no results found:\n{page_content[:1000]}...") # Log first 1k chars
-
-                logger.info(f"Found {len(result_elements)} potential search result elements using final selector.")
-                count = 0
-                for i, element in enumerate(result_elements):
-                    if count >= max_results:
-                        logger.info(f"Reached max_results ({max_results}). Stopping extraction.")
-                        break
-                    try:
-                        # Find link and title within the result element
-                        link_element = await element.query_selector(link_selector)
-                        title_element = await element.query_selector(title_selector) # Title is often inside link, but selector targets h3 directly
-
-                        # Get URL from link element
-                        url = await link_element.get_attribute("href") if link_element else None
-                        # Get Title text
-                        title = await title_element.inner_text() if title_element else None
-
-                        # Basic validation
+                        # If still invalid, skip
                         if not title or not url or not url.startswith("http"):
-                            # Try finding title directly within the element if not in link (less common structure)
-                            if not title:
-                                h3_direct = await element.query_selector(title_selector)
-                                if h3_direct: title = await h3_direct.inner_text()
-                            if not url:
-                                a_direct = await element.query_selector("a") # Simplest 'a' tag fallback
-                                if a_direct: url = await a_direct.get_attribute("href")
+                            logger.debug(f"Skipping result {i+1}: Invalid/missing title/URL. Title: '{title}', URL: '{url}'")
+                            continue
 
-                            # If still invalid, skip
-                            if not title or not url or not url.startswith("http"):
-                                logger.debug(f"Skipping result {i+1}: Invalid/missing title/URL. Title: '{title}', URL: '{url}'")
-                                continue
-
-                        # Find and clean snippet text
-                        snippet_element = await element.query_selector(snippet_selector)
-                        snippet = "No description available"
-                        if snippet_element:
-                            raw_snippet = await snippet_element.inner_text()
-                            snippet = ' '.join(raw_snippet.split()).strip() # Clean whitespace
-                        # Fallback snippet attempt if primary fails (e.g., for 'div.g' structure)
-                        elif not snippet_element:
-                            snippet_fallback_element = await element.query_selector("div[data-content-feature='1']") # Example old selector
-                            if snippet_fallback_element:
-                                raw_snippet = await snippet_fallback_element.inner_text()
-                                snippet = ' '.join(raw_snippet.split()).strip()
+                    # Find and clean snippet text
+                    snippet_element = await element.query_selector(snippet_selector)
+                    snippet = "No description available"
+                    if snippet_element:
+                        raw_snippet = await snippet_element.inner_text()
+                        snippet = ' '.join(raw_snippet.split()).strip() # Clean whitespace
+                    # Fallback snippet attempt if primary fails (e.g., for 'div.g' structure)
+                    elif not snippet_element:
+                        snippet_fallback_element = await element.query_selector("div[data-content-feature='1']") # Example old selector
+                        if snippet_fallback_element:
+                            raw_snippet = await snippet_fallback_element.inner_text()
+                            snippet = ' '.join(raw_snippet.split()).strip()
 
 
-                        results.append(SearchResult(
-                            title=title.strip(),
-                            url=url,
-                            snippet=snippet, # Already stripped
-                            source_type="web_search_result",
-                            metadata={"search_engine": "google", "position": count + 1, "query": query, "raw_element_index": i + 1}
-                        ))
-                        count += 1
-                        logger.debug(f"Extracted Google result {count}: {title.strip()} -> {url}")
+                    results.append(SearchResult(
+                        title=title.strip(),
+                        url=url,
+                        snippet=snippet, # Already stripped
+                        source_type="web_search_result",
+                        metadata={"search_engine": "google", "position": count + 1, "query": query, "raw_element_index": i + 1}
+                    ))
+                    count += 1
+                    logger.debug(f"Extracted Google result {count}: {title.strip()} -> {url}")
 
-                    except Exception as parse_err:
-                        logger.warning(f"Error parsing Google search result element index {i}: {parse_err}", exc_info=False) # Set exc_info=True for traceback
+                except Exception as parse_err:
+                    logger.warning(f"Error parsing Google search result element index {i}: {parse_err}", exc_info=False) # Set exc_info=True for traceback
 
-                logger.info(f"Successfully extracted {len(results)} valid Google search results.")
-                return results
+            logger.info(f"Successfully extracted {len(results)} valid Google search results.")
+            return results
 
-            except PlaywrightTimeoutError as timeout_err:
-                logger.error(f"Timeout error during Google search for '{query}': {timeout_err}")
-                if page: await page.screenshot(path=self.get_screenshot_path("Google Search_timeout_error"))
-                return []
-            except Exception as e:
-                logger.exception(f"An unexpected error occurred during Google search for '{query}': {e}")
-                if page: await page.screenshot(path=self.get_screenshot_path("Google Search_unexpected_error"))
-                return []
-            finally:
-                if page:
-                    try:
-                        await page.close()
-                    except Exception as page_close_err:
-                        logger.warning(f"Error closing page: {page_close_err}")
+        except PlaywrightTimeoutError as timeout_err:
+            logger.error(f"Timeout error during Google search for '{query}': {timeout_err}")
+            if page: await page.screenshot(path=self.get_screenshot_path("Google Search_timeout_error"))
+            return []
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred during Google search for '{query}': {e}")
+            if page: await page.screenshot(path=self.get_screenshot_path("Google Search_unexpected_error"))
+            return []
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception as page_close_err:
+                    logger.warning(f"Error closing page: {page_close_err}")
 
-    async def bing_search(self, query: str, max_results: int) -> List[SearchResult]:
+    async def bing_search(self, query: str, max_results: int, time_filter: Optional[str] = None, custom_start_date: Optional[date] = None, custom_end_date: Optional[date] = None) -> List[SearchResult]:
+
         page = None
         logger.info(f"Performing Bing search for: '{query}' (max_results: {max_results})")
         try:
@@ -437,7 +474,12 @@ class PlaywrightBrowserManager:
             # page.set_default_timeout() already called
 
             encoded_query = query.replace(' ', '+')
-            await page.goto(f"https://www.bing.com/search?q={encoded_query}", wait_until="domcontentloaded")
+            # Add time filter parameter to URL
+            filter_param = self.get_time_filter_param("bing", time_filter, custom_start_date, custom_end_date)
+            search_url = f"https://www.bing.com/search?q={encoded_query}{filter_param}"
+            
+            logger.debug(f"Navigating to Bing search URL: {search_url}")
+            await page.goto(search_url, wait_until="domcontentloaded")
 
             try:
                  accept_button = page.get_by_role("button", name="Accept", exact=True).or_(page.locator("#bnp_btn_accept"))
@@ -489,7 +531,8 @@ class PlaywrightBrowserManager:
                 except Exception as e:
                     logger.warning(f"Error closing page: {e}")
 
-    async def brave_search(self, query: str, max_results: int) -> List[SearchResult]:
+    async def brave_search(self, query: str, max_results: int, time_filter: Optional[str] = None, custom_start_date: Optional[date] = None, custom_end_date: Optional[date] = None) -> List[SearchResult]:
+  
         page = None
         # --- Updated Selectors ---
         # ASSUMPTION: Verify this selector holds all the result snippets using Inspect Element
@@ -509,7 +552,10 @@ class PlaywrightBrowserManager:
             page = await self.get_page() # Stealth applied automatically
 
             encoded_query = query.replace(' ', '+')
-            search_url = f"https://search.brave.com/search?q={encoded_query}"
+            # Add time filter parameter to URL
+            filter_param = self.get_time_filter_param("brave", time_filter, custom_start_date, custom_end_date)
+            search_url = f"https://search.brave.com/search?q={encoded_query}{filter_param}"
+            
             logger.debug(f"Navigating to Brave search URL: {search_url}")
             await page.goto(search_url, wait_until="domcontentloaded")
 
@@ -765,3 +811,74 @@ class PlaywrightBrowserManager:
                 except Exception as e:
                     logger.warning(f"Error closing page: {e}")
 
+    def get_time_filter_param(self, engine: str, time_filter: Optional[str], 
+                            start_date: Optional[date], end_date: Optional[date]) -> str:
+        """Generate time filter query parameter based on the search engine and filter settings.
+        
+        Args:
+            engine: The search engine to use ('brave', 'bing', or 'google')
+            time_filter: Time filter option ('past_hour', 'past_day', 'past_week', 'past_month', 'past_year', 'custom')
+            start_date: Start date for custom date range
+            end_date: End date for custom date range
+            
+        Returns:
+            String containing the appropriate query parameter for the specified search engine and time filter
+        """
+        logger.debug(f"Time filter for search: '{time_filter}'")
+        logger.debug(f"Start date for search: '{start_date}'")
+        logger.debug(f"End date for search: '{end_date}'")
+        
+        # Handle custom date range consistently
+        if time_filter == "custom":
+            if not (start_date and end_date):
+                logger.warning("Custom time filter specified but missing start_date or end_date")
+                return ""
+            
+            if engine == "brave":
+                param = f"&tf={start_date.isoformat()}to{end_date.isoformat()}"
+            elif engine == "bing":
+                param = f'&filters=ex1%3a"ez5_{self.bing_date_index(start_date)}_{self.bing_date_index(end_date)}"'
+            elif engine == "google":
+                start = start_date.strftime("%m/%d/%Y")
+                end = end_date.strftime("%m/%d/%Y")
+                param = f"&tbs=cdr:1,cd_min:{start},cd_max:{end}"
+            else:
+                logger.warning(f"Unsupported search engine: {engine}")
+                return ""
+                
+            logger.debug(f"Return for custom date search: {param}")
+            return param
+        
+        # Handle predefined time filters
+        if engine == "brave":
+            mapping = {
+                "past_day": "&tf=pd",
+                "past_week": "&tf=pw",
+                "past_month": "&tf=pm",
+                "past_year": "&tf=py",
+            }
+        elif engine == "bing":
+            mapping = {
+                "past_day": '&filters=ex1%3a"ez1"',
+                "past_week": '&filters=ex1%3a"ez2"',
+                "past_month": '&filters=ex1%3a"ez3"',
+                "past_year": '&filters=ex1%3a"ez4"',
+            }
+        elif engine == "google":
+            mapping = {
+                "past_hour": "&tbs=qdr:h",
+                "past_day": "&tbs=qdr:d",
+                "past_week": "&tbs=qdr:w",
+                "past_month": "&tbs=qdr:m",
+                "past_year": "&tbs=qdr:y",
+            }
+        else:
+            logger.warning(f"Unsupported search engine: {engine}")
+            return ""
+        
+        param = mapping.get(time_filter, "")
+        logger.debug(f"Return for search: {param}")
+        return param
+    
+    def bing_date_index(self,d: date) -> int:
+        return (d - date(1960, 1, 1)).days
