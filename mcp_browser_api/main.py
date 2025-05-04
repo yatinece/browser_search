@@ -128,14 +128,41 @@ async def search(request: SearchRequest, manager: PlaywrightBrowserManager = Dep
     """Performs search on Google, Bing, or Brave."""
     # Endpoint implementation remains largely the same, relies on manager methods
     try:
+        if request.search_engine not in ["google", "bing", "brave"]:
+            raise HTTPException(status_code=400, detail="Invalid search engine. Use 'google', 'bing', or 'brave'")
+    
+        if request.time_filter == "custom" and (not request.custom_start_date or not request.custom_end_date):
+            raise HTTPException(status_code=400, detail="Custom time filter requires both start and end dates")
         start_time = time.time()
         logger.info(f"Received search request: Engine='{request.search_engine}', Query='{request.query}', Max Results='{request.max_results}'")
         search_engine = request.search_engine.lower()
         results = []
 
-        if search_engine == "google": results = await manager.Google_Search(request.query, request.max_results)
-        elif search_engine == "bing": results = await manager.bing_search(request.query, request.max_results)
-        elif search_engine == "brave": results = await manager.brave_search(request.query, request.max_results)
+        # Call the appropriate search method based on the engine
+        if request.search_engine == "google":
+            results = await manager.Google_Search(
+                query=request.query,
+                max_results=request.max_results,
+                time_filter=request.time_filter,
+                custom_start_date=request.custom_start_date,
+                custom_end_date=request.custom_end_date
+            )
+        elif request.search_engine == "bing":
+            results = await manager.bing_search(
+                query=request.query,
+                max_results=request.max_results,
+                time_filter=request.time_filter,
+                custom_start_date=request.custom_start_date,
+                custom_end_date=request.custom_end_date
+            )
+        elif request.search_engine == "brave":
+            results = await manager.brave_search(
+                query=request.query,
+                max_results=request.max_results,
+                time_filter=request.time_filter,
+                custom_start_date=request.custom_start_date,
+                custom_end_date=request.custom_end_date
+            )
         else:
             logger.warning(f"Unsupported search engine requested: {request.search_engine}")
             raise HTTPException(status_code=400, detail=f"Unsupported search engine: {request.search_engine}. Use 'google', 'bing', or 'brave'.")
