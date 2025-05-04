@@ -29,7 +29,6 @@ setup(
         "playwright-stealth",
         "pymupdf",
         "aiohttp",
-        "urllib",
     ],
     cmdclass={
         'install': PostInstallCommand,

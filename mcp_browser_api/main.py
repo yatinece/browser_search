@@ -31,7 +31,7 @@ if BROWSER_TYPE not in ["chromium", "firefox", "webkit"]:
 os.makedirs("logs", exist_ok=True)
 log_filename = f"logs/mcp_browser_api_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s",
     handlers=[
         logging.FileHandler(log_filename),
