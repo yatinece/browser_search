@@ -20,3 +20,5 @@ pymupdf
 
 # Data validation
 pydantic
+
+playwright-stealth
