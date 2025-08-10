@@ -1,6 +1,22 @@
 setuptools 
 wheel
 pymupdf
+# Web framework
+fastapi
+uvicorn
 
+# Async browser automation
+playwright
 
-##   pip install .
+# Environment variables
+python-dotenv
+
+# HTTP requests
+requests
+aiohttp
+
+# PDF processing
+pymupdf
+
+# Data validation
+pydantic
