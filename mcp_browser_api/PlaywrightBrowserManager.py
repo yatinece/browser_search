@@ -13,7 +13,7 @@ from playwright.async_api import (
     async_playwright, Playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError, BrowserContext
 )
 # Make sure stealth is installed: pip install playwright-stealth
-from playwright_stealth import stealth_async
+#from playwright_stealth import stealth_async
 from dotenv import load_dotenv
 import urllib
 load_dotenv()  # Automatically looks for .env in current dir
