@@ -3,4 +3,4 @@
 pip install -r requirements.txt
 
 # Install Playwright browsers without asking for sudo
-python -m playwright install --with-deps chromium
+python -m playwright install chromium
