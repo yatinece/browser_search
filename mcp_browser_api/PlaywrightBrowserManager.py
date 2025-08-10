@@ -292,6 +292,7 @@ class PlaywrightBrowserManager:
 
             logger.debug("Navigating to https://www.google.com/")
             await page.goto("https://www.google.com/", wait_until="domcontentloaded")
+            await self.perform_human_like_interactions(page)
             await asyncio.sleep(random.uniform(0.5, 1.5)) # Short delay after nav
 
             # --- Cookie Consent Handling ---
@@ -762,7 +763,7 @@ class PlaywrightBrowserManager:
 
             # --- Content Extraction Logic (using simplified approach for brevity) ---
             content = ""
-            content_selectors = ["article", "main", "[role='main']", ".entry-content", ".post-content", ".article-content", "#content", ".content"]
+            content_selectors = ["article", "main", "[role='main']", ".entry-content", ".post-content", ".article-content", "#content", ".content" ,".listicle-body" ,".js-expandable"]
             logger.debug(f"Attempting content extraction using selectors for {url}")
             best_content = ""
             for selector in content_selectors:
@@ -882,3 +883,21 @@ class PlaywrightBrowserManager:
     
     def bing_date_index(self,d: date) -> int:
         return (d - date(1960, 1, 1)).days
+    
+    async def perform_human_like_interactions(self, page):
+        """Simulate realistic human behavior on the page."""
+        # Random scrolling
+        scroll_amount = random.randint(300, 700)
+        for _ in range(random.randint(1, 3)):
+            await page.evaluate(f"window.scrollBy(0, {scroll_amount});")
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+        
+        # Random mouse movements
+        for _ in range(random.randint(3, 7)):
+            x = random.randint(100, 1000)
+            y = random.randint(100, 600)
+            await page.mouse.move(x, y)
+            await asyncio.sleep(random.uniform(0.1, 0.4))
+        
+        # Add some "thinking time" before important actions
+        await asyncio.sleep(random.uniform(1.0, 3.0))
